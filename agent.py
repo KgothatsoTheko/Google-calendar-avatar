@@ -1,9 +1,9 @@
 import asyncio
 import logging
-import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -30,6 +30,7 @@ load_dotenv(BASE_DIR / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calendar-avatar")
 
+TZ = ZoneInfo("Asia/Tbilisi")
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 AVATAR_ID = "8c1cc84a-1a48-40ca-a0ab-e25e699dfd60"
 VOICE_ID = "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
@@ -66,71 +67,132 @@ calendar = build(
 )
 
 
+def parse_event_time(value):
+    """Parse an event timestamp in the calendar's timezone."""
+    dt = datetime.fromisoformat(value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+
+    return dt.astimezone(TZ)
+
+
 def get_events():
-    """Fetch recent and upcoming calendar events."""
-    now = datetime.now().astimezone()
+    """Get recent and upcoming events, excluding stale events."""
+    now = datetime.now(TZ)
+    window_start = now - timedelta(hours=3)
+    window_end = now + timedelta(hours=12)
 
     with calendar_lock:
         response = calendar.events().list(
             calendarId="primary",
-            timeMin=(now - timedelta(hours=3)).isoformat(),
-            timeMax=(now + timedelta(hours=12)).isoformat(),
+            timeMin=window_start.isoformat(),
+            timeMax=window_end.isoformat(),
+            timeZone=TZ.key,
             singleEvents=True,
             orderBy="startTime",
+            maxResults=250,
         ).execute()
 
-    return response.get("items", [])
+    events = []
+
+    for event in response.get("items", []):
+        start_data = event["start"]
+        end_data = event["end"]
+
+        # All-day events use dates rather than timestamps.
+        if "date" in start_data:
+            event_date = date.fromisoformat(start_data["date"])
+
+            # Keep all-day events starting around today,
+            # not old all-day events spanning several months.
+            if window_start.date() <= event_date <= window_end.date():
+                events.append(event)
+
+            continue
+
+        start = parse_event_time(start_data["dateTime"])
+        end = parse_event_time(end_data["dateTime"])
+
+        starts_in_window = window_start <= start < window_end
+
+        # Keep a normal event already in progress, but reject
+        # long-running stale events that began months ago.
+        currently_running = (
+            start <= now < end
+            and end - start <= timedelta(hours=12)
+        )
+
+        if starts_in_window or currently_running:
+            events.append(event)
+
+    logger.info(
+        "Calendar checked at %s; found %d relevant events.",
+        now.strftime("%Y-%m-%d %H:%M %Z"),
+        len(events),
+    )
+
+    return events
 
 
 def read_schedule():
-    """Return calendar events with readable timing information."""
-    now = datetime.now().astimezone()
+    """Give the AI dated, timezone-aware calendar information."""
+    now = datetime.now(TZ)
     lines = []
 
     for event in get_events():
         title = event.get("summary", "Untitled event")
         start_data = event["start"]
 
-        if "dateTime" not in start_data:
-            lines.append(f"{title}: all-day event")
+        if "date" in start_data:
+            event_date = date.fromisoformat(start_data["date"])
+            lines.append(
+                f"ALL-DAY EVENT: {title}; "
+                f"date: {event_date:%A, %d %B %Y}"
+            )
             continue
 
-        start = datetime.fromisoformat(
-            start_data["dateTime"]
-        ).astimezone()
-
-        end = datetime.fromisoformat(
-            event["end"]["dateTime"]
-        ).astimezone()
+        start = parse_event_time(start_data["dateTime"])
+        end = parse_event_time(event["end"]["dateTime"])
 
         if start <= now < end:
             minutes = int((now - start).total_seconds() // 60)
-            status = f"started {minutes} minutes ago"
+            status = f"IN PROGRESS; started {minutes} minutes ago"
         elif start > now:
             minutes = max(
                 1,
                 int((start - now).total_seconds() // 60),
             )
-            status = f"starts in {minutes} minutes"
+            status = f"UPCOMING; starts in {minutes} minutes"
         else:
-            status = "already ended"
+            status = "ENDED"
 
         lines.append(
-            f"{title}: {start:%H:%M}, {status}; ID: {event['id']}"
+            f"{title}; scheduled for "
+            f"{start:%A, %d %B %Y at %H:%M %Z}; "
+            f"ends at {end:%H:%M %Z}; {status}; "
+            f"event ID: {event['id']}"
         )
 
+    schedule = "\n".join(lines) if lines else "No relevant events found."
+
     return (
-        f"Current local time: {now:%A, %H:%M}\n"
-        + ("\n".join(lines) if lines else "No calendar events found.")
+        f"CURRENT DATE AND TIME: "
+        f"{now:%A, %d %B %Y at %H:%M %Z}\n"
+        f"TIMEZONE: {TZ.key}\n"
+        f"CALENDAR EVENTS:\n{schedule}"
     )
 
 
 def move_event(event_id: str, new_start: str):
-    """Move a timed event while preserving its duration."""
+    """Move a timed event and preserve its duration."""
     start = datetime.fromisoformat(new_start)
 
     if start.tzinfo is None or start.utcoffset() is None:
-        raise ValueError("Provide a timezone offset in new_start.")
+        raise ValueError(
+            "Include a timezone offset, e.g. "
+            "2026-10-12T15:30:00+04:00."
+        )
 
     with calendar_lock:
         event = calendar.events().get(
@@ -144,17 +206,14 @@ def move_event(event_id: str, new_start: str):
         ):
             raise ValueError("All-day events cannot be moved.")
 
-        old_start = datetime.fromisoformat(
-            event["start"]["dateTime"]
-        )
-        old_end = datetime.fromisoformat(
-            event["end"]["dateTime"]
-        )
+        old_start = parse_event_time(event["start"]["dateTime"])
+        old_end = parse_event_time(event["end"]["dateTime"])
+        duration = old_end - old_start
 
         event["start"]["dateTime"] = start.isoformat()
-        event["end"]["dateTime"] = (
-            start + (old_end - old_start)
-        ).isoformat()
+        event["end"]["dateTime"] = (start + duration).isoformat()
+        event["start"]["timeZone"] = TZ.key
+        event["end"]["timeZone"] = TZ.key
 
         calendar.events().update(
             calendarId="primary",
@@ -162,10 +221,10 @@ def move_event(event_id: str, new_start: str):
             body=event,
         ).execute()
 
-    return f"Moved to {start.astimezone():%A at %H:%M}."
+    return f"Moved to {start.astimezone(TZ):%A, %d %B at %H:%M}."
 
 
-# Avatar
+# AI avatar
 class CalendarAvatar(Agent):
     def __init__(self):
         super().__init__(
@@ -174,17 +233,22 @@ You are the user's calendar, given a face.
 
 Be dry, deadpan, direct, and concise.
 Speak in one or two short sentences.
+
+Use the exact current date and times provided by the
+calendar tool. Never guess the date from memory.
+
 Check the calendar before answering calendar questions.
-State accurately how long ago an event started.
-Never assume the user is late or absent based only on a calendar.
+Only refer to events actually listed in the tool response.
+Distinguish upcoming, ongoing, and ended events.
+Never assume the user is absent or personally late.
 Use the rescheduling tool when asked to move an event.
-Confirm changes only after the tool succeeds.
+Confirm a change only after the tool succeeds.
 """
         )
 
     @function_tool
     async def get_schedule(self) -> str:
-        """Read current and upcoming Google Calendar events."""
+        """Read the dated Google Calendar schedule."""
         return await asyncio.to_thread(read_schedule)
 
     @function_tool
@@ -193,14 +257,11 @@ Confirm changes only after the tool succeeds.
         event_id: str,
         new_start: str,
     ) -> str:
-        """Move a timed event. Include a timezone offset, e.g.
-        2026-10-12T15:30:00+04:00."""
-        return await asyncio.to_thread(
-            move_event, event_id, new_start
-        )
+        """Move a timed event using an ISO timestamp with timezone."""
+        return await asyncio.to_thread(move_event, event_id, new_start)
 
 
-# Preload VAD outside the active voice session.
+# Load voice activity detection once per worker.
 server = AgentServer()
 
 
@@ -211,13 +272,14 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
+# Automatic reminders
 async def send_reminders(session: AgentSession):
     reminded = set()
 
     while True:
         try:
             events = await asyncio.to_thread(get_events)
-            now = datetime.now().astimezone()
+            now = datetime.now(TZ)
 
             for event in events:
                 value = event["start"].get("dateTime")
@@ -225,14 +287,11 @@ async def send_reminders(session: AgentSession):
                 if not value or event["id"] in reminded:
                     continue
 
-                start = datetime.fromisoformat(value).astimezone()
+                start = parse_event_time(value)
                 seconds_left = (start - now).total_seconds()
 
                 if 0 < seconds_left <= 300:
-                    minutes = max(
-                        1,
-                        int((seconds_left + 59) // 60),
-                    )
+                    minutes = max(1, int((seconds_left + 59) // 60))
 
                     await session.say(
                         f"Reminder. "
@@ -254,7 +313,6 @@ async def send_reminders(session: AgentSession):
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # Connect early instead of waiting for session startup to connect.
     await ctx.connect()
 
     session = AgentSession(
@@ -272,41 +330,32 @@ async def entrypoint(ctx: JobContext):
     await avatar.start(session, room=ctx.room)
     logger.info("Synthesia avatar joined.")
 
-    await session.start(
-        agent=CalendarAvatar(),
-        room=ctx.room,
-    )
+    await session.start(agent=CalendarAvatar(), room=ctx.room)
 
-    # Fetch the opening schedule in a background thread.
     try:
         schedule = await asyncio.to_thread(read_schedule)
     except Exception:
-        logger.exception("Could not read the opening calendar")
-        schedule = "Calendar unavailable. Do not invent any events."
+        logger.exception("Could not load the opening schedule")
+        schedule = "Calendar unavailable. Do not invent events."
 
     await session.generate_reply(
         instructions=f"""
-Open with one or two short, dry, deadpan sentences.
-
-Current calendar information:
+Current calendar data:
 {schedule}
 
-Mention events currently in progress or starting within 30 minutes.
-State the scheduled time and elapsed minutes accurately.
-Do not claim the user is absent or personally late.
-Do not recite the entire calendar.
+Open with one or two short, deadpan sentences.
+Use the exact date and event times from this data.
+Mention only events in progress or starting within 30 minutes.
+Do not invent dates, events, or attendance.
+If nothing is imminent, briefly state the current date and time.
 """
     )
 
     reminder_task = asyncio.create_task(send_reminders(session))
 
-    # LiveKit 1.8.6 needs a regular callable here, not task.cancel itself.
     async def stop_reminders():
         reminder_task.cancel()
-        await asyncio.gather(
-            reminder_task,
-            return_exceptions=True,
-        )
+        await asyncio.gather(reminder_task, return_exceptions=True)
 
     ctx.add_shutdown_callback(stop_reminders)
 
