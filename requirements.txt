@@ -1,0 +1,4 @@
+livekit-agents[silero,synthesia]~=1.8
+python-dotenv
+google-api-python-client
+google-auth-oauthlib
