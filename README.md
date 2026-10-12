@@ -7,7 +7,7 @@ Instead of checking your calendar manually, talk to an interactive AI assistant 
 ## Demo
 
 <!-- Add a demo GIF or screenshot here. -->
-
+https://github.com/user-attachments/assets/76448bb7-52af-4698-9060-4cd0547a794b
 <!-- Example: ![Google Calendar Avatar](assets/demo.gif) -->
 
 <!-- Add a link to a video demonstration here when available. -->
